@@ -24,7 +24,7 @@ if (!$wp_load_path) {
 }
 
 require_once $wp_load_path;
-global $wpdb;
+global $wpdb, $table_prefix;
 
 define('AES_SECRET', 'your-password-or-secret-here');
 
@@ -48,6 +48,11 @@ function h($s) {
     return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8');
 }
 
+function display_config_value($value) {
+    $value = (string) $value;
+    return $value === '' ? '(empty)' : $value;
+}
+
 function get_primary_key($table) {
     global $wpdb;
     $res = $wpdb->get_results("SHOW KEYS FROM `$table` WHERE Key_name = 'PRIMARY'", ARRAY_A);
@@ -60,6 +65,12 @@ function get_table_columns($table) {
 }
 
 $tables = $wpdb->get_col("SHOW TABLES");
+
+$db_name = defined('DB_NAME') ? DB_NAME : '';
+$db_host = defined('DB_HOST') ? DB_HOST : '';
+$db_user = defined('DB_USER') ? DB_USER : '';
+$db_password = defined('DB_PASSWORD') ? DB_PASSWORD : '';
+$db_prefix = isset($table_prefix) && $table_prefix !== '' ? $table_prefix : $wpdb->prefix;
 
 $action = isset($_GET['action']) ? $_GET['action'] : (isset($_GET['table']) ? 'browse' : 'tables');
 $current_table = isset($_GET['table']) ? $_GET['table'] : null;
@@ -312,7 +323,7 @@ if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value']
     $pk = get_primary_key($current_table);
 }
 
-$hero_title = $current_table ? $current_table : DB_NAME;
+$hero_title = $current_table ? $current_table : $db_name;
 $hero_note = 'Browse tables, inspect structure, and work with data through one calmer admin workspace.';
 
 if ($action === 'browse' && $current_table) {
@@ -330,9 +341,17 @@ if ($action === 'browse' && $current_table) {
 }
 
 $hero_metrics = [
-    ['label' => 'Database', 'value' => DB_NAME],
+    ['label' => 'Database', 'value' => display_config_value($db_name)],
     ['label' => 'Mode', 'value' => ucfirst($action)],
     ['label' => 'Tables', 'value' => number_format(count($tables))],
+];
+
+$connection_details = [
+    ['label' => 'Database Name', 'value' => display_config_value($db_name)],
+    ['label' => 'Server Address', 'value' => display_config_value($db_host)],
+    ['label' => 'Username', 'value' => display_config_value($db_user)],
+    ['label' => 'Password', 'value' => display_config_value($db_password)],
+    ['label' => 'Table Prefix', 'value' => display_config_value($db_prefix)],
 ];
 
 if ($current_table) {
@@ -349,7 +368,7 @@ if ($action === 'browse' && $total !== null) {
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Database Manager - <?= h(DB_NAME) ?></title>
+    <title>Database Manager - <?= h($db_name) ?></title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
@@ -651,6 +670,43 @@ if ($action === 'browse' && $total !== null) {
         }
 
         .metric strong {
+            display: block;
+            font-family: var(--mono);
+            font-size: 0.98rem;
+            color: var(--text);
+            word-break: break-word;
+        }
+
+        .connection-panel {
+            margin-bottom: 18px;
+            padding: 18px 20px;
+            border-radius: 16px;
+            border: 1px solid var(--line);
+            background: #ffffff;
+        }
+
+        .connection-panel h3 {
+            margin: 0 0 8px;
+        }
+
+        .connection-panel p {
+            margin: 0 0 16px;
+        }
+
+        .connection-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+
+        .connection-item {
+            padding: 14px 16px;
+            border-radius: 12px;
+            border: 1px solid var(--line);
+            background: var(--panel-muted);
+        }
+
+        .connection-item strong {
             display: block;
             font-family: var(--mono);
             font-size: 0.98rem;
@@ -1065,7 +1121,7 @@ if ($action === 'browse' && $total !== null) {
             <div class="brand-mark">DB</div>
             <div>
                 <div class="eyebrow">WordPress Data Workspace</div>
-                <h1><?= h(DB_NAME) ?></h1>
+                <h1><?= h($db_name) ?></h1>
                 <div class="header-subtitle">Manage rows, structure, and encrypted SQL from one polished control surface.</div>
             </div>
         </div>
@@ -1110,6 +1166,20 @@ if ($action === 'browse' && $total !== null) {
                         <div class="metric">
                             <span class="metric-label"><?= h($metric['label']) ?></span>
                             <strong><?= h($metric['value']) ?></strong>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
+            <div class="connection-panel">
+                <div class="eyebrow">Connection</div>
+                <h3>Manual Connection Details</h3>
+                <p>Use these saved values when you need to connect from another database client later.</p>
+                <div class="connection-grid">
+                    <?php foreach ($connection_details as $detail): ?>
+                        <div class="connection-item">
+                            <span class="metric-label"><?= h($detail['label']) ?></span>
+                            <strong><?= h($detail['value']) ?></strong>
                         </div>
                     <?php endforeach; ?>
                 </div>
