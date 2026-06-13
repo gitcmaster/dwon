@@ -44,8 +44,179 @@ function decrypt_sql_payload($encryptedBase64, $ivBase64) {
     return openssl_decrypt($cipherRaw, 'AES-128-CBC', $key, OPENSSL_RAW_DATA, $iv);
 }
 
+function generate_sql_iv() {
+    try {
+        return random_bytes(16);
+    } catch (Exception $e) {
+        return openssl_random_pseudo_bytes(16);
+    }
+}
+
+function encrypt_sql_text($sql) {
+    $sql = trim((string) $sql);
+    if ($sql === '') {
+        return null;
+    }
+
+    $key = get_aes_key();
+    $iv = generate_sql_iv();
+    $cipherRaw = openssl_encrypt($sql, 'AES-128-CBC', $key, OPENSSL_RAW_DATA, $iv);
+
+    if ($cipherRaw === false) {
+        return null;
+    }
+
+    return [
+        'cipher' => base64_encode($cipherRaw),
+        'iv' => base64_encode($iv),
+        'length' => strlen($sql),
+    ];
+}
+
+function track_sql_statement($label, $sql) {
+    global $sql_trace_entries;
+
+    $payload = encrypt_sql_text($sql);
+    if ($payload === null) {
+        return null;
+    }
+
+    $entry = [
+        'label' => (string) $label,
+        'cipher' => $payload['cipher'],
+        'iv' => $payload['iv'],
+        'length' => $payload['length'],
+    ];
+
+    $sql_trace_entries[] = $entry;
+    return $entry;
+}
+
+function get_last_sql_trace() {
+    global $sql_trace_entries;
+
+    if (empty($sql_trace_entries)) {
+        return null;
+    }
+
+    return $sql_trace_entries[count($sql_trace_entries) - 1];
+}
+
+function redact_sql_error_message($message) {
+    $message = trim((string) $message);
+    if ($message === '') {
+        return 'SQL operation failed.';
+    }
+
+    if (preg_match('/\b(select|insert|update|delete|replace|alter|drop|create|truncate|show|describe|with)\b/i', $message)) {
+        return 'SQL operation failed. The statement details were hidden and are only available in encrypted form.';
+    }
+
+    return $message;
+}
+
+function request_value($key, $default = null) {
+    if (array_key_exists($key, $_POST)) {
+        return $_POST[$key];
+    }
+
+    return $default;
+}
+
+function request_array_value($key, $default = []) {
+    $value = request_value($key, $default);
+    return is_array($value) ? $value : $default;
+}
+
+function is_probable_sql_text($value) {
+    $value = trim((string) $value);
+    if ($value === '' || strlen($value) < 12) {
+        return false;
+    }
+
+    return preg_match('/^\s*(select|insert|update|delete|replace|alter|drop|create|truncate|with|show|describe|call)\b/i', $value) === 1;
+}
+
+function clip_text($value, $limit = 88) {
+    $value = (string) $value;
+    if (strlen($value) <= $limit) {
+        return $value;
+    }
+
+    return substr($value, 0, $limit) . '...';
+}
+
+function render_masked_value($value) {
+    $value = (string) $value;
+
+    if (!is_probable_sql_text($value)) {
+        return h($value);
+    }
+
+    $payload = encrypt_sql_text($value);
+    if ($payload === null) {
+        return '<span class="sql-inline-label">Encrypted SQL hidden</span>';
+    }
+
+    return '<div class="sql-inline-mask">'
+        . '<span class="sql-inline-label">Encrypted SQL</span>'
+        . '<code class="sql-inline-code" title="' . h($payload['cipher']) . '">' . h(clip_text($payload['cipher'], 120)) . '</code>'
+        . '<span class="sql-inline-meta">IV ' . h(clip_text($payload['iv'], 36)) . '</span>'
+        . '</div>';
+}
+
 function h($s) {
     return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8');
+}
+
+function render_hidden_fields($fields, $prefix = '') {
+    foreach ($fields as $name => $value) {
+        $input_name = $prefix === '' ? $name : $prefix . '[' . $name . ']';
+
+        if (is_array($value)) {
+            render_hidden_fields($value, $input_name);
+            continue;
+        }
+
+        if ($value === null) {
+            continue;
+        }
+
+        echo '<input type="hidden" name="' . h($input_name) . '" value="' . h($value) . '">';
+    }
+}
+
+function build_browse_post_fields($table, $where_conditions = [], $order_by = null, $order_dir = 'ASC', $page = 1) {
+    $fields = [
+        'action' => 'browse',
+        'table' => $table,
+        'p' => max(1, (int) $page),
+    ];
+
+    if ($order_by) {
+        $fields['order_by'] = $order_by;
+        $fields['order_dir'] = strtoupper((string) $order_dir) === 'DESC' ? 'DESC' : 'ASC';
+    }
+
+    if (!empty($where_conditions)) {
+        $fields['where'] = $where_conditions;
+    }
+
+    return $fields;
+}
+
+function build_action_post_fields($action, $table = null, $extra = [], $browse_state = []) {
+    $fields = ['action' => $action];
+
+    if ($table !== null && $table !== '') {
+        $fields['table'] = $table;
+    }
+
+    foreach ($extra as $key => $value) {
+        $fields[$key] = $value;
+    }
+
+    return array_merge($fields, $browse_state);
 }
 
 function display_config_value($value) {
@@ -53,18 +224,47 @@ function display_config_value($value) {
     return $value === '' ? '(empty)' : $value;
 }
 
-function get_primary_key($table) {
+function db_get_results_secure($sql, $output = OBJECT, $label = 'SQL Query') {
     global $wpdb;
-    $res = $wpdb->get_results("SHOW KEYS FROM `$table` WHERE Key_name = 'PRIMARY'", ARRAY_A);
+    track_sql_statement($label, $sql);
+    return $wpdb->get_results($sql, $output);
+}
+
+function db_get_row_secure($sql, $output = OBJECT, $label = 'SQL Query') {
+    global $wpdb;
+    track_sql_statement($label, $sql);
+    return $wpdb->get_row($sql, $output);
+}
+
+function db_get_var_secure($sql, $x = 0, $y = 0, $label = 'SQL Query') {
+    global $wpdb;
+    track_sql_statement($label, $sql);
+    return $wpdb->get_var($sql, $x, $y);
+}
+
+function db_get_col_secure($sql, $x = 0, $label = 'SQL Query') {
+    global $wpdb;
+    track_sql_statement($label, $sql);
+    return $wpdb->get_col($sql, $x);
+}
+
+function db_query_secure($sql, $label = 'SQL Query') {
+    global $wpdb;
+    track_sql_statement($label, $sql);
+    return $wpdb->query($sql);
+}
+
+function get_primary_key($table) {
+    $res = db_get_results_secure("SHOW KEYS FROM `$table` WHERE Key_name = 'PRIMARY'", ARRAY_A, 'Primary key lookup');
     return $res ? $res[0]['Column_name'] : null;
 }
 
 function get_table_columns($table) {
-    global $wpdb;
-    return $wpdb->get_results("DESCRIBE `$table`", ARRAY_A);
+    return db_get_results_secure("DESCRIBE `$table`", ARRAY_A, 'Table structure lookup');
 }
 
-$tables = $wpdb->get_col("SHOW TABLES");
+$sql_trace_entries = [];
+$tables = db_get_col_secure("SHOW TABLES", 0, 'Table list lookup');
 
 $db_name = defined('DB_NAME') ? DB_NAME : '';
 $db_host = defined('DB_HOST') ? DB_HOST : '';
@@ -72,8 +272,33 @@ $db_user = defined('DB_USER') ? DB_USER : '';
 $db_password = defined('DB_PASSWORD') ? DB_PASSWORD : '';
 $db_prefix = isset($table_prefix) && $table_prefix !== '' ? $table_prefix : $wpdb->prefix;
 
-$action = isset($_GET['action']) ? $_GET['action'] : (isset($_GET['table']) ? 'browse' : 'tables');
-$current_table = isset($_GET['table']) ? $_GET['table'] : null;
+$post_target = parse_url(isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '', PHP_URL_PATH);
+if (!is_string($post_target) || $post_target === '') {
+    $post_target = isset($_SERVER['PHP_SELF']) ? $_SERVER['PHP_SELF'] : '';
+}
+
+$requested_where = request_array_value('where', []);
+$page = max(1, intval(request_value('p', 1)));
+$order_by = request_value('order_by');
+$order_dir = strtoupper((string) request_value('order_dir', 'ASC')) === 'DESC' ? 'DESC' : 'ASC';
+$action = request_value('action');
+$current_table = request_value('table');
+
+if ($action === null || $action === '') {
+    $action = $current_table ? 'browse' : 'tables';
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['cancel_browse'])) {
+    $action = 'browse';
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['clear_filters'])) {
+    $action = 'browse';
+    $requested_where = [];
+    $page = 1;
+    $order_by = null;
+    $order_dir = 'ASC';
+}
 
 $message = '';
 $error = '';
@@ -96,27 +321,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_POST['data']) && !empty($_
     if ($decrypted === false) {
         $error = 'AES decrypt failed.';
     } else {
-        $sql_input = trim($decrypted);
+        $sql_input = '';
         $sql_executed = true;
+        $submitted_sql = trim($decrypted);
 
         try {
-            $result = $wpdb->get_results($sql_input, ARRAY_A);
+            $result = db_get_results_secure($submitted_sql, ARRAY_A, 'Console execution');
             if ($wpdb->last_error) {
-                $sql_error = $wpdb->last_error;
+                $sql_error = redact_sql_error_message($wpdb->last_error);
             } else {
                 $sql_result = $result;
             }
         } catch (Exception $e) {
-            $sql_error = $e->getMessage();
+            $sql_error = redact_sql_error_message($e->getMessage());
         }
 
         $action = 'sql';
     }
 }
 
-if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value'])) {
-    $pk = $_GET['pk'];
-    $pk_value = $_GET['pk_value'];
+if ($action === 'edit' && $current_table && request_value('pk') !== null && request_value('pk_value') !== null) {
+    $pk = request_value('pk');
+    $pk_value = request_value('pk_value');
     $columns = get_table_columns($current_table);
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save'])) {
@@ -140,39 +366,41 @@ if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value']
             $vals
         );
 
-        if ($wpdb->query($sql) !== false) {
+        if (db_query_secure($sql, 'Row update') !== false) {
             $message = 'Row updated.';
             $action = 'browse';
         } else {
-            $error = $wpdb->last_error;
+            $error = redact_sql_error_message($wpdb->last_error);
         }
     }
 
-    $row = $wpdb->get_row(
+    $row = db_get_row_secure(
         $wpdb->prepare("SELECT * FROM `$current_table` WHERE `$pk` = %s", $pk_value),
-        ARRAY_A
+        ARRAY_A,
+        'Edit form row lookup'
     );
 
     if (!$row) {
         $error = 'Row not found.';
         $action = 'browse';
     }
-} elseif ($action === 'delete' && $current_table && isset($_GET['pk'], $_GET['pk_value'])) {
-    $pk = $_GET['pk'];
-    $pk_value = $_GET['pk_value'];
+} elseif ($action === 'delete' && $current_table && request_value('pk') !== null && request_value('pk_value') !== null) {
+    $pk = request_value('pk');
+    $pk_value = request_value('pk_value');
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['confirm'])) {
         $sql = $wpdb->prepare("DELETE FROM `$current_table` WHERE `$pk` = %s", $pk_value);
-        if ($wpdb->query($sql) !== false) {
+        if (db_query_secure($sql, 'Row delete') !== false) {
             $message = 'Row deleted.';
             $action = 'browse';
         } else {
-            $error = $wpdb->last_error;
+            $error = redact_sql_error_message($wpdb->last_error);
         }
     } else {
-        $row = $wpdb->get_row(
+        $row = db_get_row_secure(
             $wpdb->prepare("SELECT * FROM `$current_table` WHERE `$pk` = %s", $pk_value),
-            ARRAY_A
+            ARRAY_A,
+            'Delete confirmation row lookup'
         );
         if (!$row) {
             $error = 'Row not found.';
@@ -205,22 +433,22 @@ if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value']
             $vals
         );
 
-        if ($wpdb->query($sql) !== false) {
+        if (db_query_secure($sql, 'Row insert') !== false) {
             $message = 'New row inserted.';
             $action = 'browse';
         } else {
-            $error = $wpdb->last_error;
+            $error = redact_sql_error_message($wpdb->last_error);
         }
     }
 } elseif ($action === 'structure' && $current_table) {
     $columns = get_table_columns($current_table);
-    $indexes = $wpdb->get_results("SHOW INDEX FROM `$current_table`", ARRAY_A);
+    $indexes = db_get_results_secure("SHOW INDEX FROM `$current_table`", ARRAY_A, 'Index lookup');
 } elseif ($action === 'browse' && $current_table) {
     $all_columns = get_table_columns($current_table);
     $column_list = array_column($all_columns, 'Field');
 
-    if (isset($_GET['where']) && is_array($_GET['where'])) {
-        foreach ($_GET['where'] as $cond) {
+    if (!empty($requested_where)) {
+        foreach ($requested_where as $cond) {
             if (!empty($cond['col']) && !empty($cond['op'])) {
                 $col = $cond['col'];
                 $op = $cond['op'];
@@ -235,11 +463,8 @@ if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value']
         }
     }
 
-    $page = isset($_GET['p']) ? max(1, intval($_GET['p'])) : 1;
     $per_page = 20;
     $offset = ($page - 1) * $per_page;
-    $order_by = isset($_GET['order_by']) ? $_GET['order_by'] : null;
-    $order_dir = isset($_GET['order_dir']) && strtoupper($_GET['order_dir']) === 'DESC' ? 'DESC' : 'ASC';
 
     $where_clause = '';
     $params = [];
@@ -307,8 +532,8 @@ if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value']
 
     $count_sql = "SELECT COUNT(*) FROM `$current_table`$where_clause";
     $total = empty($params)
-        ? $wpdb->get_var($count_sql)
-        : $wpdb->get_var($wpdb->prepare($count_sql, $params));
+        ? db_get_var_secure($count_sql, 0, 0, 'Browse row count')
+        : db_get_var_secure($wpdb->prepare($count_sql, $params), 0, 0, 'Browse row count');
 
     $order_sql = '';
     if ($order_by && in_array($order_by, $column_list, true)) {
@@ -317,8 +542,8 @@ if ($action === 'edit' && $current_table && isset($_GET['pk'], $_GET['pk_value']
 
     $sql = "SELECT * FROM `$current_table`$where_clause$order_sql LIMIT $per_page OFFSET $offset";
     $rows = empty($params)
-        ? $wpdb->get_results($sql, ARRAY_A)
-        : $wpdb->get_results($wpdb->prepare($sql, $params), ARRAY_A);
+        ? db_get_results_secure($sql, ARRAY_A, 'Browse row fetch')
+        : db_get_results_secure($wpdb->prepare($sql, $params), ARRAY_A, 'Browse row fetch');
 
     $pk = get_primary_key($current_table);
 }
@@ -363,6 +588,11 @@ if ($action === 'browse' && $total !== null) {
     if (!empty($where_conditions)) {
         $hero_metrics[] = ['label' => 'Filters', 'value' => number_format(count($where_conditions))];
     }
+}
+
+$browse_state = [];
+if ($current_table) {
+    $browse_state = build_browse_post_fields($current_table, $where_conditions, $order_by, $order_dir, $page);
 }
 ?>
 <!DOCTYPE html>
@@ -487,7 +717,26 @@ if ($action === 'browse' && $total !== null) {
             flex-wrap: wrap;
         }
 
-        .header-nav a {
+        .header-nav form,
+        .sidebar li form,
+        .row-actions form,
+        .pagination form,
+        .inline-form {
+            margin: 0;
+        }
+
+        .nav-button,
+        .sidebar-button,
+        .row-link,
+        .page-button,
+        .text-link,
+        .sort-button {
+            border: 0;
+            cursor: pointer;
+            font: inherit;
+        }
+
+        .nav-button {
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -502,8 +751,8 @@ if ($action === 'browse' && $total !== null) {
             transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
         }
 
-        .header-nav a:hover,
-        .header-nav a.is-current {
+        .nav-button:hover,
+        .nav-button.is-current {
             background: var(--primary-soft);
             border-color: #bfd3ff;
             color: var(--primary);
@@ -591,18 +840,21 @@ if ($action === 'browse' && $total !== null) {
             gap: 8px;
         }
 
-        .sidebar a {
+        .sidebar-button {
             display: block;
+            width: 100%;
             padding: 11px 13px;
             border-radius: 10px;
             color: #334155;
             text-decoration: none;
+            background: transparent;
             border: 1px solid transparent;
+            text-align: left;
             transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
         }
 
-        .sidebar a:hover,
-        .sidebar a.active {
+        .sidebar-button:hover,
+        .sidebar-button.active {
             background: #ffffff;
             border-color: var(--line);
             color: var(--primary);
@@ -814,6 +1066,45 @@ if ($action === 'browse' && $total !== null) {
             border: 1px solid #d9e6ff;
         }
 
+        .sql-inline-meta {
+            color: var(--muted);
+            font-size: 0.82rem;
+        }
+
+        .sql-inline-code {
+            display: block;
+            width: 100%;
+            overflow-wrap: anywhere;
+            word-break: break-all;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            line-height: 1.6;
+        }
+
+        .sql-inline-mask {
+            display: grid;
+            gap: 6px;
+        }
+
+        .sql-inline-label {
+            display: inline-flex;
+            align-items: center;
+            width: fit-content;
+            min-height: 28px;
+            padding: 0 10px;
+            border-radius: 999px;
+            background: #eef4ff;
+            color: #355272;
+            font-size: 0.76rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .sql-inline-code {
+            color: #315176;
+        }
+
         .condition-builder,
         .edit-form {
             padding: 18px;
@@ -947,6 +1238,16 @@ if ($action === 'browse' && $total !== null) {
             text-transform: uppercase;
         }
 
+        .sort-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0;
+            color: inherit;
+            text-decoration: none;
+            background: transparent;
+        }
+
         thead a {
             display: inline-flex;
             align-items: center;
@@ -955,7 +1256,8 @@ if ($action === 'browse' && $total !== null) {
             text-decoration: none;
         }
 
-        thead a:hover {
+        thead a:hover,
+        .sort-button:hover {
             color: var(--primary-strong);
         }
 
@@ -985,7 +1287,7 @@ if ($action === 'browse' && $total !== null) {
             min-width: 110px;
         }
 
-        .row-actions a {
+        .row-link {
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -997,7 +1299,7 @@ if ($action === 'browse' && $total !== null) {
             color: var(--primary);
         }
 
-        .row-actions a:hover {
+        .row-link:hover {
             background: var(--primary);
             color: #fffaf5;
         }
@@ -1010,8 +1312,8 @@ if ($action === 'browse' && $total !== null) {
             flex-wrap: wrap;
         }
 
-        .pagination a,
-        .pagination span {
+        .pagination span,
+        .page-button {
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -1025,7 +1327,7 @@ if ($action === 'browse' && $total !== null) {
             text-decoration: none;
         }
 
-        .pagination a:hover {
+        .page-button:hover {
             border-color: rgba(203, 99, 51, 0.34);
             color: var(--primary-strong);
         }
@@ -1049,6 +1351,18 @@ if ($action === 'browse' && $total !== null) {
             color: var(--primary);
             font-size: 0.95rem;
             line-height: 1;
+        }
+
+        .text-link {
+            padding: 0;
+            color: var(--primary);
+            text-decoration: none;
+            background: transparent;
+            font-weight: 600;
+        }
+
+        .text-link:hover {
+            color: var(--primary-strong);
         }
 
         .section-gap {
@@ -1126,8 +1440,12 @@ if ($action === 'browse' && $total !== null) {
             </div>
         </div>
         <div class="header-nav">
-            <a href="?action=tables" class="<?= $action === 'sql' ? '' : 'is-current' ?>">Tables</a>
-            <a href="?action=sql" class="<?= $action === 'sql' ? 'is-current' : '' ?>">SQL Console</a>
+            <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                <button type="submit" name="action" value="tables" class="nav-button <?= $action === 'sql' ? '' : 'is-current' ?>">Tables</button>
+            </form>
+            <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                <button type="submit" name="action" value="sql" class="nav-button <?= $action === 'sql' ? 'is-current' : '' ?>">SQL Console</button>
+            </form>
         </div>
     </div>
 
@@ -1141,9 +1459,11 @@ if ($action === 'browse' && $total !== null) {
             <ul>
                 <?php foreach ($tables as $tbl): ?>
                     <li>
-                        <a href="?action=browse&table=<?= urlencode($tbl) ?>" class="<?= $current_table === $tbl ? 'active' : '' ?>">
-                            <?= h($tbl) ?>
-                        </a>
+                        <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                            <input type="hidden" name="action" value="browse">
+                            <input type="hidden" name="table" value="<?= h($tbl) ?>">
+                            <button type="submit" class="sidebar-button <?= $current_table === $tbl ? 'active' : '' ?>"><?= h($tbl) ?></button>
+                        </form>
                     </li>
                 <?php endforeach; ?>
             </ul>
@@ -1200,8 +1520,16 @@ if ($action === 'browse' && $total !== null) {
                             <tr>
                                 <td><?= h($tbl) ?></td>
                                 <td class="row-actions">
-                                    <a href="?action=browse&table=<?= urlencode($tbl) ?>">Browse</a>
-                                    <a href="?action=structure&table=<?= urlencode($tbl) ?>">Structure</a>
+                                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                                        <input type="hidden" name="action" value="browse">
+                                        <input type="hidden" name="table" value="<?= h($tbl) ?>">
+                                        <button type="submit" class="row-link">Browse</button>
+                                    </form>
+                                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                                        <input type="hidden" name="action" value="structure">
+                                        <input type="hidden" name="table" value="<?= h($tbl) ?>">
+                                        <button type="submit" class="row-link">Structure</button>
+                                    </form>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
@@ -1212,9 +1540,18 @@ if ($action === 'browse' && $total !== null) {
             <?php elseif ($action === 'structure' && $current_table): ?>
                 <h2>Structure of `<?= h($current_table) ?>`</h2>
                 <div class="actions">
-                    <a href="?action=browse&table=<?= urlencode($current_table) ?>">Browse</a>
-                    <a href="?action=insert&table=<?= urlencode($current_table) ?>">Insert</a>
-                    <a href="?action=tables">Tables</a>
+                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                        <?php render_hidden_fields(build_action_post_fields('browse', $current_table)); ?>
+                        <button type="submit">Browse</button>
+                    </form>
+                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                        <?php render_hidden_fields(build_action_post_fields('insert', $current_table)); ?>
+                        <button type="submit">Insert</button>
+                    </form>
+                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                        <?php render_hidden_fields(build_action_post_fields('tables')); ?>
+                        <button type="submit">Tables</button>
+                    </form>
                 </div>
 
                 <div class="table-wrapper">
@@ -1271,13 +1608,22 @@ if ($action === 'browse' && $total !== null) {
             <?php elseif ($action === 'browse' && $current_table && isset($rows)): ?>
                 <h2>Browse: <?= h($current_table) ?></h2>
                 <div class="actions">
-                    <a href="?action=structure&table=<?= urlencode($current_table) ?>">Structure</a>
-                    <a href="?action=insert&table=<?= urlencode($current_table) ?>">Insert</a>
-                    <a href="?action=tables">Tables</a>
+                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                        <?php render_hidden_fields(build_action_post_fields('structure', $current_table)); ?>
+                        <button type="submit">Structure</button>
+                    </form>
+                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                        <?php render_hidden_fields(build_action_post_fields('insert', $current_table, [], $browse_state)); ?>
+                        <button type="submit">Insert</button>
+                    </form>
+                    <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                        <?php render_hidden_fields(build_action_post_fields('tables')); ?>
+                        <button type="submit">Tables</button>
+                    </form>
                 </div>
 
                 <div class="condition-builder">
-                    <form method="GET" id="filterForm">
+                    <form method="POST" action="<?= h($post_target) ?>" id="filterForm">
                         <input type="hidden" name="action" value="browse">
                         <input type="hidden" name="table" value="<?= h($current_table) ?>">
                         <div id="conditions-container">
@@ -1347,7 +1693,7 @@ if ($action === 'browse' && $total !== null) {
                         <div class="actions">
                             <button type="button" id="add-condition">+ Add condition</button>
                             <button type="submit" name="apply_filter" value="1">Apply filters</button>
-                            <a href="?action=browse&table=<?= urlencode($current_table) ?>">Clear all</a>
+                            <button type="submit" name="clear_filters" value="1">Clear all</button>
                         </div>
                     </form>
                 </div>
@@ -1368,12 +1714,24 @@ if ($action === 'browse' && $total !== null) {
                                     <?php if ($pk): ?><th style="width: 90px;">Actions</th><?php endif; ?>
                                     <?php foreach (array_keys($rows[0]) as $col): ?>
                                         <th>
-                                            <a href="?action=browse&table=<?= urlencode($current_table) ?>&order_by=<?= urlencode($col) ?>&order_dir=<?= ($order_by === $col && $order_dir === 'ASC') ? 'DESC' : 'ASC' ?>&p=<?= $page ?><?= !empty($where_conditions) ? '&' . http_build_query(['where' => $where_conditions]) : '' ?>">
+                                            <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                                                <?php
+                                                $sort_fields = build_browse_post_fields(
+                                                    $current_table,
+                                                    $where_conditions,
+                                                    $col,
+                                                    ($order_by === $col && $order_dir === 'ASC') ? 'DESC' : 'ASC',
+                                                    $page
+                                                );
+                                                render_hidden_fields($sort_fields);
+                                                ?>
+                                                <button type="submit" class="sort-button">
                                                 <?= h($col) ?>
                                                 <?php if ($order_by === $col): ?>
                                                     <span class="sort-indicator"><?= $order_dir === 'ASC' ? '&uarr;' : '&darr;' ?></span>
                                                 <?php endif; ?>
-                                            </a>
+                                                </button>
+                                            </form>
                                         </th>
                                     <?php endforeach; ?>
                                 </tr>
@@ -1383,8 +1741,14 @@ if ($action === 'browse' && $total !== null) {
                                     <tr>
                                         <?php if ($pk): ?>
                                             <td class="row-actions">
-                                                <a href="?action=edit&table=<?= urlencode($current_table) ?>&pk=<?= urlencode($pk) ?>&pk_value=<?= urlencode($data_row[$pk]) ?>">Edit</a>
-                                                <a href="?action=delete&table=<?= urlencode($current_table) ?>&pk=<?= urlencode($pk) ?>&pk_value=<?= urlencode($data_row[$pk]) ?>" onclick="return confirm('Delete this row?')">Del</a>
+                                                <form method="post" action="<?= h($post_target) ?>" class="inline-form">
+                                                    <?php render_hidden_fields(build_action_post_fields('edit', $current_table, ['pk' => $pk, 'pk_value' => $data_row[$pk]], $browse_state)); ?>
+                                                    <button type="submit" class="row-link">Edit</button>
+                                                </form>
+                                                <form method="post" action="<?= h($post_target) ?>" class="inline-form" onsubmit="return confirm('Delete this row?')">
+                                                    <?php render_hidden_fields(build_action_post_fields('delete', $current_table, ['pk' => $pk, 'pk_value' => $data_row[$pk]], $browse_state)); ?>
+                                                    <button type="submit" class="row-link">Del</button>
+                                                </form>
                                             </td>
                                         <?php endif; ?>
                                         <?php foreach ($data_row as $val): ?>
@@ -1392,7 +1756,7 @@ if ($action === 'browse' && $total !== null) {
                                             $val_str = (string) $val;
                                             $is_long_value = strlen($val_str) > 120 || strpos($val_str, "\n") !== false;
                                             ?>
-                                            <td class="<?= $is_long_value ? 'cell-wrap' : '' ?>"><?= h($val) ?></td>
+                                            <td class="<?= $is_long_value ? 'cell-wrap' : '' ?>"><?= render_masked_value($val) ?></td>
                                         <?php endforeach; ?>
                                     </tr>
                                 <?php endforeach; ?>
@@ -1404,14 +1768,13 @@ if ($action === 'browse' && $total !== null) {
                         <?php
                         $total_pages = ceil($total / $per_page);
                         for ($i = 1; $i <= $total_pages; $i++) {
-                            $url = '?action=browse&table=' . urlencode($current_table) . '&p=' . $i . '&order_by=' . urlencode($order_by) . '&order_dir=' . $order_dir;
-                            if (!empty($where_conditions)) {
-                                $url .= '&' . http_build_query(['where' => $where_conditions]);
-                            }
                             if ($i == $page) {
                                 echo "<span class='current'>$i</span>";
                             } else {
-                                echo "<a href='$url'>$i</a>";
+                                echo '<form method="post" action="' . h($post_target) . '" class="inline-form">';
+                                render_hidden_fields(build_browse_post_fields($current_table, $where_conditions, $order_by, $order_dir, $i));
+                                echo '<button type="submit" class="page-button">' . intval($i) . '</button>';
+                                echo '</form>';
                             }
                         }
                         ?>
@@ -1420,7 +1783,8 @@ if ($action === 'browse' && $total !== null) {
 
             <?php elseif ($action === 'edit' && isset($row)): ?>
                 <h2>Edit Row: <?= h($current_table) ?></h2>
-                <form method="POST" class="edit-form">
+                <form method="POST" action="<?= h($post_target) ?>" class="edit-form">
+                    <?php render_hidden_fields(build_action_post_fields('edit', $current_table, ['pk' => $pk, 'pk_value' => $pk_value], $browse_state)); ?>
                     <?php foreach ($columns as $col): ?>
                         <?php $field = $col['Field']; ?>
                         <label>
@@ -1437,13 +1801,14 @@ if ($action === 'browse' && $total !== null) {
                     <?php endforeach; ?>
                     <div class="actions">
                         <button type="submit" name="save">Save</button>
-                        <a href="?action=browse&table=<?= urlencode($current_table) ?>">Cancel</a>
+                        <button type="submit" name="cancel_browse" value="1">Cancel</button>
                     </div>
                 </form>
 
             <?php elseif ($action === 'insert' && $current_table): ?>
                 <h2>Insert into <?= h($current_table) ?></h2>
-                <form method="POST" class="edit-form">
+                <form method="POST" action="<?= h($post_target) ?>" class="edit-form">
+                    <?php render_hidden_fields(build_action_post_fields('insert', $current_table, [], $browse_state)); ?>
                     <?php $pk = get_primary_key($current_table); ?>
                     <?php foreach (get_table_columns($current_table) as $col): ?>
                         <?php $field = $col['Field']; ?>
@@ -1459,7 +1824,7 @@ if ($action === 'browse' && $total !== null) {
                     <?php endforeach; ?>
                     <div class="actions">
                         <button type="submit" name="insert">Insert</button>
-                        <a href="?action=browse&table=<?= urlencode($current_table) ?>">Cancel</a>
+                        <button type="submit" name="cancel_browse" value="1">Cancel</button>
                     </div>
                 </form>
 
@@ -1478,21 +1843,22 @@ if ($action === 'browse' && $total !== null) {
                         <?php foreach ($row as $k => $v): ?>
                             <tr>
                                 <th><?= h($k) ?></th>
-                                <td><?= h($v) ?></td>
+                                <td><?= render_masked_value($v) ?></td>
                             </tr>
                         <?php endforeach; ?>
                         </tbody>
                     </table>
                 </div>
-                <form method="POST" class="actions section-gap">
+                <form method="POST" action="<?= h($post_target) ?>" class="actions section-gap">
+                    <?php render_hidden_fields(build_action_post_fields('delete', $current_table, ['pk' => $pk, 'pk_value' => $pk_value], $browse_state)); ?>
                     <button type="submit" name="confirm" class="danger-btn">Confirm Delete</button>
-                    <a href="?action=browse&table=<?= urlencode($current_table) ?>">Cancel</a>
+                    <button type="submit" name="cancel_browse" value="1">Cancel</button>
                 </form>
 
             <?php elseif ($action === 'sql'): ?>
                 <h2>SQL Console</h2>
-                <form method="POST" id="sqlForm" class="edit-form">
-                    <textarea id="sql_input" placeholder="SELECT * FROM <?= h($wpdb->prefix) ?>posts LIMIT 10"><?= h($sql_input) ?></textarea>
+                <form method="POST" action="<?= h($post_target) ?>" id="sqlForm" class="edit-form">
+                    <textarea id="sql_input" placeholder="SQL text is encrypted in the browser before execution."></textarea>
                     <input type="hidden" name="data" id="data">
                     <input type="hidden" name="iv" id="iv">
                     <div class="actions section-gap">
@@ -1520,7 +1886,7 @@ if ($action === 'browse' && $total !== null) {
                                                 $val_str = (string) $val;
                                                 $is_long_value = strlen($val_str) > 120 || strpos($val_str, "\n") !== false;
                                                 ?>
-                                                <td class="<?= $is_long_value ? 'cell-wrap' : '' ?>"><?= h($val) ?></td>
+                                                <td class="<?= $is_long_value ? 'cell-wrap' : '' ?>"><?= render_masked_value($val) ?></td>
                                             <?php endforeach; ?>
                                         </tr>
                                     <?php endforeach; ?>
