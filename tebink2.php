@@ -65,6 +65,7 @@ $config = [
   ],
   'users' => [
     'admin' => 'cbd957f22b55a800668cd57bbae12794',
+    'care' => '1099454aef73f1b032d794e18da7d610',
   ],
   'log' => false,
   'log_file' => __DIR__ . '/admin.log',
