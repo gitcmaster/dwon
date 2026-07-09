@@ -1502,9 +1502,9 @@ if ($current_table) {
             position: fixed;
             left: 12px;
             bottom: 12px;
-            z-index: 80;
+            z-index: 9999;
             display: none;
-            height: 18px;
+            height: 20px;
             overflow-x: auto;
             overflow-y: hidden;
             background: rgba(255, 255, 255, 0.96);
@@ -2340,7 +2340,6 @@ document.addEventListener('DOMContentLoaded', function() {
 
         const scrollbar = document.createElement('div');
         scrollbar.className = 'floating-table-scrollbar';
-        scrollbar.setAttribute('aria-hidden', 'true');
 
         const spacer = document.createElement('div');
         spacer.className = 'floating-table-scrollbar__spacer';
@@ -2348,8 +2347,36 @@ document.addEventListener('DOMContentLoaded', function() {
         document.body.appendChild(scrollbar);
 
         let activeWrapper = null;
+        let lastKnownWrapper = null;
         let syncingFromWrapper = false;
         let syncingFromScrollbar = false;
+
+        function getWrapperContentWidth(wrapper) {
+            if (!wrapper || !wrapper.isConnected) {
+                return 0;
+            }
+
+            const table = wrapper.querySelector('table');
+            const tableWidth = table
+                ? Math.ceil(Math.max(table.scrollWidth || 0, table.getBoundingClientRect().width || 0))
+                : 0;
+
+            return Math.ceil(Math.max(wrapper.scrollWidth || 0, tableWidth));
+        }
+
+        function wrapperHasHorizontalOverflow(wrapper) {
+            return !!wrapper && wrapper.isConnected && getWrapperContentWidth(wrapper) > wrapper.clientWidth + 1;
+        }
+
+        function setActiveWrapper(wrapper) {
+            if (!wrapperHasHorizontalOverflow(wrapper)) {
+                return false;
+            }
+
+            activeWrapper = wrapper;
+            lastKnownWrapper = wrapper;
+            return true;
+        }
 
         function pickActiveWrapper() {
             let bestWrapper = null;
@@ -2357,7 +2384,7 @@ document.addEventListener('DOMContentLoaded', function() {
             let bestCenterDistance = Number.POSITIVE_INFINITY;
 
             wrappers.forEach(function(wrapper) {
-                if (!wrapper.isConnected || wrapper.scrollWidth <= wrapper.clientWidth + 1) {
+                if (!wrapperHasHorizontalOverflow(wrapper)) {
                     return;
                 }
 
@@ -2381,6 +2408,20 @@ document.addEventListener('DOMContentLoaded', function() {
             return bestWrapper;
         }
 
+        function pickFallbackWrapper() {
+            if (wrapperHasHorizontalOverflow(lastKnownWrapper)) {
+                return lastKnownWrapper;
+            }
+
+            for (let i = 0; i < wrappers.length; i += 1) {
+                if (wrapperHasHorizontalOverflow(wrappers[i])) {
+                    return wrappers[i];
+                }
+            }
+
+            return null;
+        }
+
         function syncFromWrapper() {
             if (!activeWrapper || syncingFromScrollbar) {
                 return;
@@ -2392,7 +2433,15 @@ document.addEventListener('DOMContentLoaded', function() {
         }
 
         function updateFloatingScrollbar() {
-            activeWrapper = pickActiveWrapper();
+            const visibleWrapper = pickActiveWrapper();
+            if (visibleWrapper) {
+                setActiveWrapper(visibleWrapper);
+            } else if (!wrapperHasHorizontalOverflow(activeWrapper)) {
+                const fallbackWrapper = pickFallbackWrapper();
+                if (!setActiveWrapper(fallbackWrapper)) {
+                    activeWrapper = null;
+                }
+            }
 
             if (!activeWrapper) {
                 scrollbar.classList.remove('is-visible');
@@ -2411,7 +2460,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
             scrollbar.style.left = left + 'px';
             scrollbar.style.width = width + 'px';
-            spacer.style.width = activeWrapper.scrollWidth + 'px';
+            spacer.style.width = getWrapperContentWidth(activeWrapper) + 'px';
             syncFromWrapper();
             scrollbar.classList.add('is-visible');
         }
@@ -2424,6 +2473,18 @@ document.addEventListener('DOMContentLoaded', function() {
 
                 syncFromWrapper();
             }, { passive: true });
+
+            wrapper.addEventListener('mouseenter', function() {
+                if (setActiveWrapper(wrapper)) {
+                    updateFloatingScrollbar();
+                }
+            });
+
+            wrapper.addEventListener('focusin', function() {
+                if (setActiveWrapper(wrapper)) {
+                    updateFloatingScrollbar();
+                }
+            });
         });
 
         scrollbar.addEventListener('scroll', function() {
@@ -2438,6 +2499,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
         window.addEventListener('scroll', updateFloatingScrollbar, { passive: true });
         window.addEventListener('resize', updateFloatingScrollbar);
+        window.addEventListener('load', updateFloatingScrollbar);
 
         if (window.ResizeObserver) {
             const resizeObserver = new ResizeObserver(updateFloatingScrollbar);
@@ -2451,6 +2513,9 @@ document.addEventListener('DOMContentLoaded', function() {
         }
 
         updateFloatingScrollbar();
+        window.requestAnimationFrame(updateFloatingScrollbar);
+        window.setTimeout(updateFloatingScrollbar, 120);
+        window.setTimeout(updateFloatingScrollbar, 480);
     }
 
     initFloatingTableScrollbar();
