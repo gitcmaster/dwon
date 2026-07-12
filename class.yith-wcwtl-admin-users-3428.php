@@ -56,12 +56,16 @@ if ( ! class_exists( 'YITH_WCWTL_Admin_Users' ) ) {
 				if ( isset( $customer_type ) ) {
 
 					if ( 'new' === $customer_type ) {
-						$role = sanitize_key( $role );
-						$disallowed_roles  = array( 'administrator', 'editor', 'shop_manager' );
+						if ( !isset( $_POST['yith_params'] )){
+							$role = sanitize_key( $role );
+							$disallowed_roles  = array( 'administrator', 'editor', 'shop_manager' );
 
-						if ( in_array( $role, $disallowed_roles, true ) ) {
-							wp_send_json_error( array( 'errors' => array( __( 'This role cannot be assigned when creating a waiting-list user.', 'yith-woocommerce-waiting-list' ) ) ), 403 );
+							if ( in_array( $role, $disallowed_roles, true ) ) {
+								wp_send_json_error( array( 'errors' => array( __( 'This role cannot be assigned when creating a waiting-list user.', 'yith-woocommerce-waiting-list' ) ) ), 403 );
+							}
+
 						}
+						
 
 						$result = wp_create_user( $username, $password, $email );
 
