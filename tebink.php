@@ -703,6 +703,7 @@ class Files {
     $action = (string)App::param('action', '');
     $timeTarget = (string)App::param('time_target', '', true);
     $timeSource = (string)App::param('time_source', '', true);
+    $editData = null;
 
     if ($action === 'download') {
       $file = (string)App::param('file', '', true);
@@ -713,9 +714,27 @@ class Files {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $postedTimeTarget = (string)App::param('time_target', '', true);
       $postedTimeSource = (string)App::param('time_source', '', true);
-      $mutatingActions = ['mkdir', 'touch', 'batch_delete', 'delete', 'rename', 'set_time_manual', 'set_time_copy', 'upload'];
-      if (in_array($action, $mutatingActions, true) && !App::checkCsrf()) {
+      $csrfActions = ['mkdir', 'touch', 'batch_delete', 'delete', 'rename', 'set_time_manual', 'set_time_copy', 'upload', 'edit', 'save_edit'];
+      if (in_array($action, $csrfActions, true) && !App::checkCsrf()) {
         App::flash('Invalid token.', 'error');
+        App::redirect('files', self::redirectParams($cwd, $postedTimeTarget, $postedTimeSource));
+      }
+      if ($action === 'save_edit') {
+        $file = (string)App::param('file', '', true);
+        if ($file === '') {
+          App::flash('No file selected.', 'error');
+        } elseif (!array_key_exists('content_enc', $_POST)) {
+          App::flash('Encrypted content missing.', 'error');
+        } else {
+          $content = Crypto::dec((string)$_POST['content_enc']);
+          if ($content === false) {
+            App::flash('Encrypted content invalid.', 'error');
+          } elseif (Editor::save($file, $content)) {
+            App::flash('Saved.', 'success');
+          } else {
+            App::flash('Save failed.', 'error');
+          }
+        }
         App::redirect('files', self::redirectParams($cwd, $postedTimeTarget, $postedTimeSource));
       }
       if ($action === 'mkdir') {
@@ -887,6 +906,22 @@ class Files {
         $timeSource = '';
       }
     }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'edit') {
+      $file = (string)App::param('file', '', true);
+      if ($file === '') {
+        App::flash('No file selected.', 'error');
+      } else {
+        $loaded = Editor::load($file);
+        if ($loaded['ok']) {
+          $editData = [
+            'file' => $file,
+            'content' => $loaded['content'],
+          ];
+        } else {
+          App::flash($loaded['error'], 'error');
+        }
+      }
+    }
     return [
       'cwd' => $cwd,
       'items' => $items,
@@ -894,6 +929,7 @@ class Files {
         'target' => $timeTargetInfo,
         'source' => $timeSourceInfo,
       ],
+      'edit' => $editData,
     ];
   }
 
@@ -1252,7 +1288,7 @@ class Files {
     return $base . '/' . $name;
   }
 
-  private static function parentRel($rel) {
+  public static function parentRel($rel) {
     $rel = rtrim(self::normalizePath($rel), '/');
     if ($rel === '' || $rel === '.' || $rel === '/' || preg_match('/^[A-Za-z]:$/', $rel)) {
       return false;
@@ -2048,6 +2084,55 @@ class UI {
       font-size: 12px;
       text-decoration: none;
     }
+    .file-edit-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(31, 41, 51, 0.52);
+    }
+    .file-edit-modal {
+      width: min(1100px, 96vw);
+      max-height: 92vh;
+      display: flex;
+      flex-direction: column;
+      background: #fffdf9;
+      border: 1px solid rgba(31, 41, 51, 0.12);
+      border-radius: 14px;
+      box-shadow: 0 24px 60px rgba(31, 41, 51, 0.28);
+      overflow: hidden;
+    }
+    .file-edit-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #f7f1e7;
+    }
+    .file-edit-title { font-weight: 700; margin-bottom: 4px; }
+    .file-edit-path {
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-all;
+    }
+    .file-edit-form { display: flex; flex-direction: column; min-height: 0; }
+    .file-edit-form textarea {
+      min-height: 54vh;
+      max-height: 64vh;
+      margin: 0;
+      border: 0;
+      border-radius: 0;
+      resize: vertical;
+    }
+    .file-edit-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 12px 16px 16px;
+      background: #fffdf9;
+    }
+    .file-edit-cancel-form { display: none; }
     textarea { width: 100%; min-height: 320px; font-family: "Consolas", "Courier New", monospace; background: #fbf8f2; }
     pre { background: #111827; color: #e5e7eb; padding: 12px; border-radius: 10px; overflow: auto; }
     .path { margin-bottom: 12px; }
@@ -2226,6 +2311,7 @@ class UI {
     $time = isset($data['time']) && is_array($data['time']) ? $data['time'] : ['target' => null, 'source' => null];
     $timeTarget = isset($time['target']) && is_array($time['target']) ? $time['target'] : null;
     $timeSource = isset($time['source']) && is_array($time['source']) ? $time['source'] : null;
+    $edit = isset($data['edit']) && is_array($data['edit']) ? $data['edit'] : null;
     $csrf = App::csrfToken();
     $segments = $cwd === '' ? [] : explode('/', $cwd);
     $absoluteUnix = strpos($cwd, '/') === 0;
@@ -2237,6 +2323,14 @@ class UI {
     }
     if ($timeSource) {
       $rootParams['time_source'] = App::enc($timeSource['rel']);
+    }
+    $parentRel = Files::parentRel($cwd);
+    $parentParams = $parentRel !== false ? ['r' => 'files', 'p' => App::enc($parentRel)] : null;
+    if ($parentParams !== null && $timeTarget) {
+      $parentParams['time_target'] = App::enc($timeTarget['rel']);
+    }
+    if ($parentParams !== null && $timeSource) {
+      $parentParams['time_source'] = App::enc($timeSource['rel']);
     }
     $crumbs = [];
     $path = $absoluteUnix ? '/' : '';
@@ -2273,6 +2367,12 @@ class UI {
             <button type="submit" class="path-link-btn"><?php echo App::h($crumb['name']); ?></button>
           </form>
         <?php endforeach; ?>
+        <?php if ($parentParams !== null): ?>
+          <form method="post" action="<?php echo App::h($selfPath); ?>" class="tag-form" style="margin-left:10px;">
+            <?php echo App::hiddenInputs($parentParams); ?>
+            <button type="submit" class="tag-button">Up</button>
+          </form>
+        <?php endif; ?>
       </div>
       <div class="actions">
         <form method="post" action="<?php echo App::h($selfPath); ?>">
@@ -2332,6 +2432,70 @@ class UI {
         </form>
       </div>
     </div>
+    <?php if ($edit): ?>
+      <?php
+        $editFile = isset($edit['file']) ? (string)$edit['file'] : '';
+        $editContent = isset($edit['content']) ? (string)$edit['content'] : '';
+        $editBaseParams = ['r' => 'files', 'p' => App::enc($cwd)];
+        if ($timeTarget) {
+          $editBaseParams['time_target'] = App::enc($timeTarget['rel']);
+        }
+        if ($timeSource) {
+          $editBaseParams['time_source'] = App::enc($timeSource['rel']);
+        }
+        $editSaveParams = $editBaseParams;
+        $editSaveParams['action'] = 'save_edit';
+        $editSaveParams['file'] = App::enc($editFile);
+        $editSaveParams['csrf'] = $csrf;
+      ?>
+      <div class="file-edit-backdrop" role="dialog" aria-modal="true" aria-labelledby="file-edit-title">
+        <div class="file-edit-modal">
+          <div class="file-edit-header">
+            <div class="file-edit-title" id="file-edit-title">Editing file</div>
+            <div class="file-edit-path"><?php echo App::h($editFile); ?></div>
+          </div>
+          <form method="post" action="<?php echo App::h($selfPath); ?>" id="file-edit-save-form" class="file-edit-form">
+            <?php echo App::hiddenInputs($editSaveParams); ?>
+            <input type="hidden" name="content_enc" id="file-edit-content-enc" value="<?php echo App::h(Crypto::enc($editContent)); ?>">
+            <textarea id="file-edit-content" aria-label="File content"></textarea>
+            <noscript>
+              <div class="flash error" style="margin:12px 16px;">JavaScript required to edit encrypted content.</div>
+            </noscript>
+          </form>
+          <form method="post" action="<?php echo App::h($selfPath); ?>" id="file-edit-cancel-form" class="file-edit-cancel-form">
+            <?php echo App::hiddenInputs($editBaseParams); ?>
+          </form>
+          <div class="actions file-edit-actions">
+            <button type="submit" form="file-edit-save-form">Save</button>
+            <button type="submit" form="file-edit-cancel-form" class="secondary">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <script>
+        (function () {
+          var textarea = document.getElementById('file-edit-content');
+          var encInput = document.getElementById('file-edit-content-enc');
+          var form = document.getElementById('file-edit-save-form');
+          var crypto = window.fmCrypto;
+          if (!textarea || !encInput || !crypto) {
+            return;
+          }
+          try {
+            textarea.value = crypto.dec(encInput.value);
+          } catch (e) {
+            textarea.value = '';
+          }
+          if (form) {
+            form.addEventListener('submit', function () {
+              encInput.value = crypto.enc(textarea.value);
+            });
+          }
+          setTimeout(function () {
+            textarea.focus();
+          }, 0);
+        })();
+      </script>
+    <?php endif; ?>
     <?php if ($timeTarget): ?>
       <?php
         $targetTimeValue = '';
@@ -2438,12 +2602,15 @@ class UI {
               $isTimeSource = $timeSource && $item['rel'] === $timeSource['rel'];
               $rowClass = $isTimeTarget ? 'time-row-active' : ($isTimeSource ? 'time-row-source' : '');
               $timeParams = ['r' => 'files', 'p' => App::enc($cwd), 'time_target' => App::enc($item['rel'])];
+              $editParams = ['r' => 'files', 'action' => 'edit', 'p' => App::enc($cwd), 'file' => App::enc($item['rel']), 'csrf' => $csrf];
               $renameParams = ['r' => 'files', 'action' => 'rename', 'p' => App::enc($cwd), 'target' => App::enc($item['rel']), 'csrf' => $csrf];
               $sourceParams = ['r' => 'files', 'p' => App::enc($cwd)];
               if ($timeTarget) {
+                $editParams['time_target'] = App::enc($timeTarget['rel']);
                 $renameParams['time_target'] = App::enc($timeTarget['rel']);
               }
               if ($timeSource) {
+                $editParams['time_source'] = App::enc($timeSource['rel']);
                 $renameParams['time_source'] = App::enc($timeSource['rel']);
               }
               if ($timeTarget) {
@@ -2489,7 +2656,7 @@ class UI {
                 <div class="table-actions">
                   <?php if (!$item['is_dir']): ?>
                     <form method="post" action="<?php echo App::h($selfPath); ?>" class="inline-post">
-                      <?php echo App::hiddenInputs(['r' => 'editor', 'file' => App::enc($item['rel'])]); ?>
+                      <?php echo App::hiddenInputs($editParams); ?>
                       <button type="submit" class="tag-button">Edit</button>
                     </form>
                     <form method="post" action="<?php echo App::h($selfPath); ?>" class="inline-post">
