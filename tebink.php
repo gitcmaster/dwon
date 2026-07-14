@@ -2802,7 +2802,7 @@ class UI {
           <input type="hidden" name="action" value="run">
           <input type="hidden" name="csrf" value="<?php echo App::h($csrf); ?>">
           <input type="hidden" name="cmd_enc" id="cmd-enc" value="<?php echo App::h($cmdEnc); ?>">
-          <input type="text" id="cmd-input" placeholder="Command" aria-label="Command">
+          <input type="text" id="cmd-input" placeholder="Command" aria-label="Command" style="width: 2048px;max-width: 100%;min-height: 124px;padding: 10px 12px;">
           <button type="submit">Execute</button>
         </form>
         <noscript>
